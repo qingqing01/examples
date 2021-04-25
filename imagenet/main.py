@@ -17,6 +17,76 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from functools import partial
+
+try:
+    from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
+    from nvidia.dali.pipeline import Pipeline
+    import nvidia.dali.types as types
+    import nvidia.dali.fn as fn
+
+except ImportError:
+    raise ImportError("Please install DALI from https://www.github.com/NVIDIA/DALI to run this example.")
+
+
+try:
+    from decode_jpeg import decode_jpeg_cuda, read_file
+except:
+    pass
+
+
+
+def create_dali_pipeline(batch_size, num_threads, device_id, data_dir, crop, size,
+                       shard_id, num_shards, dali_cpu=False, is_training=True, args=None):
+    pipeline = Pipeline(batch_size, num_threads, device_id, seed=12 + device_id)
+    with pipeline:
+        images, labels = fn.file_reader(file_root=data_dir,
+                                        shard_id=args.rank,
+                                        num_shards=args.world_size,
+                                        random_shuffle=is_training,
+                                        pad_last_batch=True,
+                                        name="Reader")
+        dali_device = 'cpu' if dali_cpu else 'gpu'
+        decoder_device = 'cpu' if dali_cpu else 'mixed'
+        device_memory_padding = 211025920 if decoder_device == 'mixed' else 0
+        host_memory_padding = 140544512 if decoder_device == 'mixed' else 0
+        if is_training:
+            images = fn.image_decoder_random_crop(images,
+                                                  device=decoder_device, output_type=types.RGB,
+                                                  device_memory_padding=device_memory_padding,
+                                                  host_memory_padding=host_memory_padding,
+                                                  random_aspect_ratio=[0.8, 1.25],
+                                                  random_area=[0.1, 1.0],
+                                                  num_attempts=100)
+            #images = fn.resize(images,
+            #                   device=dali_device,
+            #                   resize_x=crop,
+            #                   resize_y=crop,
+            #                   interp_type=types.INTERP_TRIANGULAR)
+            images = fn.random_resized_crop(images, size=size)
+            mirror = fn.random.coin_flip(probability=0.5)
+        else:
+            images = fn.image_decoder(images,
+                                      device=decoder_device,
+                                      output_type=types.RGB)
+            images = fn.resize(images,
+                               device=dali_device,
+                               size=size,
+                               mode="not_smaller",
+                               interp_type=types.INTERP_TRIANGULAR)
+            mirror = False
+
+        images = fn.crop_mirror_normalize(images.gpu(),
+                                          dtype=types.FLOAT,
+                                          output_layout="CHW",
+                                          crop=(crop, crop),
+                                          mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                          std=[0.229 * 255,0.224 * 255,0.225 * 255],
+                                          mirror=mirror)
+        labels = labels.gpu()
+        pipeline.set_outputs(images, labels)
+    return pipeline
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -30,7 +100,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -74,7 +144,34 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
+parser.add_argument('--use_dali', action='store_true',
+                    help='Use DALI pipeline.')
+parser.add_argument('--dali_cpu', action='store_true',
+                    help='Runs CPU based version of DALI pipeline.')
+
 best_acc1 = 0
+
+class ToGPU:
+  def __init__(self, gpu_id):
+      self.gpu_id = gpu_id
+
+  def __call__(self, pic):
+      im = pic.cuda(non_blocking=True)
+      return im
+
+class DecodeJpegCUDA:
+    def __init__(self):
+        pass
+    def __call__(self, pic):
+        im = decode_jpeg_cuda(pic, 3)
+        #print(im.shape, im)
+        im = im.float().div(255)
+        #print(im.shape, im)
+        return im
+
+
+def load_file(path):
+    return read_file(path)
 
 
 def main():
@@ -112,6 +209,11 @@ def main():
         main_worker(args.gpu, ngpus_per_node, args)
 
 
+def worker_init_fn(worker_id, rank=None):
+    print("set device id ", rank)
+    torch.cuda.set_device(rank)
+
+
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
@@ -126,8 +228,10 @@ def main_worker(gpu, ngpus_per_node, args):
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
+            print(args.rank, ngpus_per_node, gpu)
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+        print('init end dist.init_process_group', args.dist_backend, args.dist_url, args.world_size, args.rank)
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -149,7 +253,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
+            print("args.workers ", args.workers, ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            print("args.workers ", args.workers, ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
@@ -199,45 +305,77 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
+    traindir = os.path.join(args.data, 'val')
     valdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    if not args.use_dali:
+        if False:
+            train_dataset = datasets.ImageFolder(
+                traindir,
+                transforms.Compose([
+                    transforms.ToTensor(),
+                    ToGPU(args.rank),
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    normalize,
+                ]))
+            print('Use ToTensor and ToGPU')
+        else:
+            train_dataset = datasets.ImageFolder(
+                traindir,
+                transforms.Compose([
+                    DecodeJpegCUDA(),
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    normalize,
+                ]),
+                loader=load_file,
+            )
+            print('Use DecodeJpegCUDA')
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        else:
+            train_sampler = None
+        print('args.workers ', args.workers)
+       
+            
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=False, sampler=train_sampler, persistent_workers=False, worker_init_fn=partial(worker_init_fn, rank=args.rank))
     else:
-        train_sampler = None
+        pipe = create_dali_pipeline(batch_size=args.batch_size,
+                                    num_threads=args.workers,
+                                    device_id=args.rank,
+                                    data_dir=traindir,
+                                    crop=224,
+                                    size=256,
+                                    dali_cpu=args.dali_cpu,
+                                    shard_id=args.rank,
+                                    num_shards=args.world_size,
+                                    is_training=True,
+                                    args=args)
+        pipe.build()
+        train_loader = DALIClassificationIterator(pipe, reader_name="Reader", last_batch_policy=LastBatchPolicy.PARTIAL)
+        print('Use DALI')
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    #val_loader = torch.utils.data.DataLoader(
+    #    datasets.ImageFolder(valdir, transforms.Compose([
+    #        transforms.Resize(256),
+    #        transforms.CenterCrop(224),
+    #        transforms.ToTensor(),
+    #        normalize,
+    #    ])),
+    #    batch_size=args.batch_size, shuffle=False,
+    #    num_workers=args.workers, pin_memory=True)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-
-    if args.evaluate:
-        validate(val_loader, model, criterion, args)
-        return
+    #if args.evaluate:
+    #    validate(val_loader, model, criterion, args)
+    #    return
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if args.distributed and not args.use_dali:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
@@ -245,11 +383,12 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        # acc1 = validate(val_loader, model, criterion, args)
 
         # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        #is_best = acc1 > best_acc1
+        is_best=False
+        #best_acc1 = max(acc1, best_acc1)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -277,11 +416,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    #for i, (images, target) in enumerate(train_loader):
+    for i, data in enumerate(train_loader):
+        if args.use_dali:
+            images = data[0]["data"]
+            target = data[0]["label"].squeeze(-1).long()
+        else:
+            images, target = data
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
+        if args.gpu is not None and not args.use_dali:
             images = images.cuda(args.gpu, non_blocking=True)
         if torch.cuda.is_available():
             target = target.cuda(args.gpu, non_blocking=True)
@@ -375,9 +520,12 @@ class AverageMeter(object):
 
     def update(self, val, n=1):
         self.val = val
-        self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
+        if self.count > 20:
+            self.sum += val * n
+            self.avg = self.sum / (self.count - 20)
+        else:
+            self.avg = 0.
 
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'

@@ -98,3 +98,19 @@ optional arguments:
                         fastest way to use PyTorch for either single node or
                         multi node data parallel training
 ```
+
+
+## GPU Transform
+
+1. GPU Transform
+
+
+```
+cd cpp
+python setup.py install
+```
+
+
+2. DALI
+
+Need install DALI at first. Then set `--use_dali`. 
